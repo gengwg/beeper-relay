@@ -58,7 +58,9 @@ class Forwarder:
         self.data_dir = Path(data_dir)
         self.reconcile_seconds = reconcile_seconds
 
-    def prepare(self, source_chat_id, message_id, destination_chat_id):
+    def prepare(
+        self, source_chat_id, message_id, destination_chat_id, *, text_override=None
+    ):
         source = self.client.get_chat(source_chat_id)
         destination = self.client.get_chat(destination_chat_id)
         message = self.client.get_message(source["id"], message_id)
@@ -71,7 +73,9 @@ class Forwarder:
                 f"beeper-relay:{message['id']}:{destination['id']}",
             )
         )
-        original_text = message["text"]
+        original_text = message["text"] if text_override is None else text_override
+        if not original_text.strip():
+            raise RelayError("there is no message content to forward")
         forwarded_text = (
             f'[Forwarded from {source["network"]} chat "{source["title"]}" '
             f"| Relay {relay_id}]\n{neutralize_mentions(original_text)}"
