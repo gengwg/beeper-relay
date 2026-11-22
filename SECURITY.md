@@ -16,7 +16,9 @@ A localhost API does not make the complete message path local. Check the connect
 - Use read-only tokens for discovery and grant write access only when sending is required.
 - Do not commit tokens, cookies, QR codes, account IDs, chat exports, logs, screenshots, or ledgers.
 - Do not enable automatic retries after an unknown send outcome; duplicates are possible.
-- Review the destination and rendered text before every confirmed send.
+- Review the destination and rendered text before every confirmed manual send.
+- For watched routes, validate the route before starting, run only one watcher per route, and do not relay initial history. Use one-way routes by default; bidirectional forwarding is limited to dedicated relay pairs with echo suppression.
+- Keep private route configurations outside the repository and suppress relay-generated echoes before forwarding.
 
 ## Data retention
 

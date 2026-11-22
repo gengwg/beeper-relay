@@ -1,0 +1,9 @@
+{
+  "routes": {
+    "x-to-slack": {
+      "source_chat": "X_CHAT_ID",
+      "destination_chat": "SLACK_CHAT_ID",
+      "mode": "dedicated"
+    }
+  }
+}

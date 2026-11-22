@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .api import APIError, BeeperClient
 from .relay import DuplicateOperation, Forwarder, RelayError
+from .watcher import Watcher
 
 DEFAULT_BASE_URL = "http://127.0.0.1:23373"
 
@@ -109,6 +110,45 @@ def forward(client, arguments):
     return 0 if ledger["status"] == "sent" else 1
 
 
+def watch_route(client, arguments):
+    config_path = arguments.config
+    if not config_path:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        config_path = Path(xdg_config) / "beeper-relay" / "routes.json"
+    config = json.loads(Path(config_path).read_text())
+    routes = config.get("routes", {})
+    if arguments.route not in routes:
+        raise RelayError(f"route {arguments.route!r} is not present in {config_path}")
+    if arguments.interval < 1:
+        raise RelayError("watch interval must be at least one second")
+
+    watcher = Watcher(
+        client, arguments.route, routes[arguments.route], data_directory()
+    )
+    source, destination = watcher.describe()
+    print(f"Route: {arguments.route}")
+    print(f"From: {source['network']} / {source['title']}")
+    print(f"To: {destination['network']} / {destination['title']}")
+    if not arguments.confirm:
+        print("Dry run only. Re-run with --confirm to start watching new messages.")
+        return 0
+
+    if routes[arguments.route].get("mode", "opt_in") == "dedicated":
+        print(
+            "Dedicated route: all new outgoing text messages are relayed; history is ignored."
+        )
+    else:
+        print(
+            "Watching for new outgoing messages starting with '/relay '. History is ignored."
+        )
+    print("Press Ctrl+C to stop.")
+    try:
+        watcher.run_forever(interval=arguments.interval, once=arguments.once)
+    except KeyboardInterrupt:
+        print("\nWatcher stopped.")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="beeper-relay",
@@ -135,6 +175,17 @@ def build_parser():
     forward_parser.add_argument(
         "--confirm", action="store_true", help="actually send once; default is dry-run"
     )
+
+    watch_parser = subparsers.add_parser(
+        "watch", help="watch one configured one-way route for new outgoing messages"
+    )
+    watch_parser.add_argument("--route", required=True, help="friendly route name")
+    watch_parser.add_argument("--config", help="path to routes.json")
+    watch_parser.add_argument("--interval", type=float, default=2)
+    watch_parser.add_argument("--once", action="store_true", help="poll once and exit")
+    watch_parser.add_argument(
+        "--confirm", action="store_true", help="start relaying; default is dry-run"
+    )
     return parser
 
 
@@ -146,6 +197,8 @@ def main(argv=None):
             show_chats(client, arguments.query, arguments.limit)
         elif arguments.command == "messages":
             show_messages(client, arguments.chat, arguments.limit)
+        elif arguments.command == "watch":
+            return watch_route(client, arguments)
         else:
             return forward(client, arguments)
         return 0

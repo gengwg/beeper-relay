@@ -9,6 +9,7 @@ from pathlib import Path
 
 from beeper_relay.api import BeeperClient
 from beeper_relay.relay import DuplicateOperation, Forwarder, RelayError
+from beeper_relay.watcher import Watcher
 
 
 class FakeBeeperHandler(BaseHTTPRequestHandler):
@@ -30,14 +31,21 @@ class FakeBeeperHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json({"error": "unauthorized"}, 401)
             return
-        path = urllib.parse.unquote(self.path)
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
         state = self.server.state
         if path == "/v1/chats/source-chat":
             self._json(state["source_chat"])
         elif path == "/v1/chats/destination-chat":
             self._json(state["destination_chat"])
-        elif path == "/v1/chats/source-chat/messages/message-1":
-            self._json(state["source_message"])
+        elif path == "/v1/chats/source-chat/messages":
+            self._json({"items": state["source_messages"]})
+        elif path.startswith("/v1/chats/source-chat/messages/"):
+            message_id = path.rsplit("/", 1)[-1]
+            message = next(
+                (item for item in state["source_messages"] if item["id"] == message_id),
+                None,
+            )
+            self._json(message or {"error": "not found"}, 200 if message else 404)
         elif path == "/v1/chats/destination-chat/messages/pending-1":
             self._json(state["sent_message"])
         else:
@@ -119,6 +127,10 @@ class ForwarderTests(unittest.TestCase):
             "provider_status": "SUCCESS",
             "mode": "success",
         }
+        state["source_message"].update(
+            {"sortKey": "100", "timestamp": "2026-01-01T00:00:00Z"}
+        )
+        state["source_messages"] = [state["source_message"]]
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeBeeperHandler)
         self.server.state = state
         self.state = state
@@ -238,6 +250,130 @@ class ForwarderTests(unittest.TestCase):
         ledger = forwarder.execute(plan)
         self.assertEqual(ledger["status"], "unknown")
         self.assertEqual(self.state["post_count"], 1)
+
+    def make_watcher(self, mode="opt_in"):
+        route = {
+            "source_chat": "source-chat",
+            "destination_chat": "destination-chat",
+            "mode": mode,
+        }
+        return Watcher(
+            self.client,
+            "x-to-slack",
+            route,
+            Path(self.tempdir.name),
+            reconcile_seconds=0.01,
+        )
+
+    def add_source_message(
+        self, message_id, key, *, own=True, text="/relay new message", sort_key=None
+    ):
+        message = {
+            "id": message_id,
+            "chatID": "source-chat",
+            "isSender": own,
+            "isDeleted": False,
+            "type": "TEXT",
+            "text": text,
+            "sortKey": str(sort_key if sort_key is not None else key),
+            "timestamp": f"2026-01-01T00:00:{key:02d}Z",
+        }
+        self.state["source_messages"].append(message)
+        return message
+
+    def test_watch_initial_snapshot_relays_nothing(self):
+        watcher = self.make_watcher()
+        results = watcher.run_once()
+        self.assertEqual(results, [{"status": "initialized", "count": 1}])
+        self.assertEqual(self.state["post_count"], 0)
+        self.assertEqual(watcher._load_state()["cursor"], 100)
+
+    def test_watch_forwards_only_new_own_messages(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message("message-2", 101)
+        results = watcher.run_once()
+        self.assertEqual(results, [{"id": "message-2", "status": "sent"}])
+        self.assertEqual(self.state["post_count"], 1)
+        self.assertTrue(self.state["forwarded_text"].endswith("\nnew message"))
+        self.assertNotIn("/relay ", self.state["forwarded_text"])
+        self.assertEqual(watcher._load_state()["cursor"], 101)
+
+    def test_watch_requires_explicit_relay_prefix(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message("ordinary-message", 101, text="ordinary text")
+        results = watcher.run_once()
+        self.assertEqual(
+            results, [{"id": "ordinary-message", "status": "not_requested"}]
+        )
+        self.assertEqual(self.state["post_count"], 0)
+        self.assertEqual(watcher._load_state()["cursor"], 101)
+
+    def test_watch_ignores_historical_and_other_people_messages(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message("old-message", 99)
+        self.add_source_message("other-person", 101, own=False)
+        results = watcher.run_once()
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["status"].startswith("skipped:"))
+        self.assertEqual(self.state["post_count"], 0)
+        self.assertEqual(watcher._load_state()["cursor"], 101)
+
+    def test_dedicated_watch_forwards_without_prefix(self):
+        watcher = self.make_watcher(mode="dedicated")
+        watcher.run_once()
+        self.add_source_message("dedicated-message", 101, text="dedicated text")
+        results = watcher.run_once()
+        self.assertEqual(results, [{"id": "dedicated-message", "status": "sent"}])
+        self.assertEqual(self.state["post_count"], 1)
+        self.assertTrue(self.state["forwarded_text"].endswith("\ndedicated text"))
+
+    def test_watch_rejects_empty_relay_prefix_content(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message("empty-relay", 101, text="/relay ")
+        results = watcher.run_once()
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["status"].startswith("skipped:"))
+        self.assertEqual(self.state["post_count"], 0)
+
+    def test_watch_suppresses_relay_echoes(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message(
+            "relay-copy",
+            101,
+            text='[Forwarded from X chat "test" | Relay abc]\nhello',
+        )
+        results = watcher.run_once()
+        self.assertEqual(
+            results, [{"id": "relay-copy", "status": "relay_echo_suppressed"}]
+        )
+        self.assertEqual(self.state["post_count"], 0)
+
+    def test_watch_suppresses_duplicate_operation(self):
+        watcher = self.make_watcher()
+        watcher.run_once()
+        self.add_source_message("message-2", 101)
+        plan = self.forwarder().prepare("source-chat", "message-2", "destination-chat")
+        self.forwarder().execute(plan)
+        results = watcher.run_once()
+        self.assertEqual(
+            results, [{"id": "message-2", "status": "duplicate_suppressed"}]
+        )
+        self.assertEqual(self.state["post_count"], 1)
+
+    def test_watch_allows_only_one_instance_per_route(self):
+        first = self.make_watcher()
+        second = self.make_watcher()
+        first.acquire_lock()
+        with self.assertRaises(RelayError):
+            second.acquire_lock()
+        first.release_lock()
+        second.acquire_lock()
+        second.release_lock()
 
 
 if __name__ == "__main__":
